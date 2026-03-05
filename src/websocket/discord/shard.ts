@@ -50,6 +50,8 @@ export class Shard {
 	isReady = false;
 
 	connectionTimeout?: NodeJS.Timeout;
+	private reconnectPromise?: Promise<void>;
+	private isConnecting = false;
 
 	private requestGuildMembersChunk = new Map<
 		string,
@@ -122,8 +124,15 @@ export class Shard {
 	}
 
 	async connect() {
+		if (this.isConnecting) {
+			this.debugger?.debug(`[Shard #${this.id}] Connect skipped while a connection attempt is in flight`);
+			return;
+		}
+
+		this.isConnecting = true;
 		await this.connectTimeout.wait();
 		if (this.isOpen) {
+			this.isConnecting = false;
 			this.debugger?.debug(`[Shard #${this.id}] Attempted to connect while open`);
 			return;
 		}
@@ -144,11 +153,15 @@ export class Shard {
 			this.handleMessage(data);
 		};
 
-		this.websocket.onclose = (event: { code: number; reason: string }) => this.handleClosed(event);
+		this.websocket.onclose = (event: { code: number; reason: string }) => {
+			this.isConnecting = false;
+			this.handleClosed(event);
+		};
 
 		this.websocket.onerror = (event: ErrorEvent) => this.logger.error(event);
 
 		this.websocket.onopen = () => {
+			this.isConnecting = false;
 			this.heart.ack = true;
 		};
 	}
@@ -228,15 +241,27 @@ export class Shard {
 	disconnect(code = ShardSocketCloseCodes.Shutdown) {
 		clearTimeout(this.connectionTimeout);
 		this.connectionTimeout = undefined;
+		this.isConnecting = false;
 		this.debugger?.info(`[Shard #${this.id}] Disconnecting`);
 		this.close(code, 'Shard down request');
 	}
 
 	async reconnect(code = ShardSocketCloseCodes.Reconnect) {
-		this.debugger?.info(`[Shard #${this.id}] Reconnecting`);
-		this.disconnect(code);
-		await delay(this.options.reconnectTimeout);
-		await this.connect();
+		this.reconnectPromise ??= (async () => {
+			this.debugger?.info(`[Shard #${this.id}] Reconnecting`);
+			this.disconnect(code);
+			await delay(this.options.reconnectTimeout);
+			await this.connect();
+		})().finally(() => {
+			this.reconnectPromise = undefined;
+		});
+
+		return this.reconnectPromise;
+	}
+
+	private flushOfflineSendQueue() {
+		const queue = this.offlineSendQueue.splice(0);
+		for (const resolve of queue) resolve();
 	}
 
 	onpacket(packet: GatewayReceivePayload) {
@@ -292,7 +317,7 @@ export class Shard {
 								clearTimeout(this.connectionTimeout);
 								this.connectionTimeout = undefined;
 								this.isReady = true;
-								this.offlineSendQueue.map(resolve => resolve());
+								this.flushOfflineSendQueue();
 								this.options.handlePayload(this.id, packet);
 							}
 							break;
@@ -305,7 +330,7 @@ export class Shard {
 
 							this.data.resume_gateway_url = packet.d.resume_gateway_url;
 							this.data.session_id = packet.d.session_id;
-							this.offlineSendQueue.map(resolve => resolve());
+							this.flushOfflineSendQueue();
 							this.options.handlePayload(this.id, packet);
 							if (this.pendingGuilds?.size === 0) {
 								this.isReady = true;

@@ -21,6 +21,7 @@ export class SeyfertWebSocket {
 		reason: string;
 	} = null;
 	__closeCalled?: boolean;
+	__closeEmitted = false;
 
 	constructor(url: string) {
 		const urlParts = new URL(url);
@@ -29,7 +30,7 @@ export class SeyfertWebSocket {
 		this.connect();
 	}
 
-	private connect(retries = 0) {
+	private connect() {
 		return new Promise<void>((resolve, rej) => {
 			const key = randomBytes(16).toString('base64');
 			const req = request({
@@ -45,6 +46,11 @@ export class SeyfertWebSocket {
 			});
 
 			req.on('upgrade', (res, socket) => {
+				if (this.__closeCalled) {
+					socket.destroy();
+					resolve();
+					return;
+				}
 				const hash = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
 				const accept = res.headers['sec-websocket-accept'];
 				if (accept !== hash) {
@@ -73,16 +79,18 @@ export class SeyfertWebSocket {
 			});
 
 			req.on('error', e => {
-				if (retries < 5) {
-					setTimeout(() => {
-						resolve(this.connect(retries + 1));
-					}, 500);
-				} else {
-					this.onerror(e);
-					setTimeout(() => {
-						resolve(this.connect(0));
-					}, 5e3);
+				this.onerror(e);
+				if (this.__closeCalled) {
+					resolve();
+					return;
 				}
+
+				this.__lastError = {
+					code: 1006,
+					reason: e.message,
+				};
+				resolve();
+				this.#emitClose(this.__lastError);
 			});
 
 			req.end();
@@ -152,19 +160,19 @@ export class SeyfertWebSocket {
 					this.onmessage({ data: body });
 				}
 				break;
-			// pong
+			// ping
 			case 0x9:
 				this.onping(body.toString());
 				break;
-			// ping
+			// pong
 			case 0xa:
 				this.onpong(body.toString());
 				break;
 			// close
 			case 0x8:
 				this.__lastError = {
-					code: body.readUInt16BE(0),
-					reason: body.subarray(2).toString(),
+					code: body.length >= 2 ? body.readUInt16BE(0) : 1005,
+					reason: body.length > 2 ? body.subarray(2).toString() : '',
 				};
 				break;
 		}
@@ -175,8 +183,12 @@ export class SeyfertWebSocket {
 		this.socket?.destroy();
 		this.socket = undefined;
 		if (this.__closeCalled) return;
-		if (!this.__lastError) return this.connect();
-		this.onclose(this.__lastError);
+		this.#emitClose(
+			this.__lastError ?? {
+				code: 1006,
+				reason: 'Socket closed without a close frame',
+			},
+		);
 		this.__lastError = null;
 	}
 
@@ -209,7 +221,7 @@ export class SeyfertWebSocket {
 	}
 
 	onping(_data: string) {
-		//
+		this.pong(_data);
 	}
 
 	onpong(_data: string) {
@@ -245,7 +257,7 @@ export class SeyfertWebSocket {
 
 		this.socket?.end();
 
-		this.onclose({ code, reason });
+		this.#emitClose({ code, reason });
 	}
 
 	pong(data: string) {
@@ -286,6 +298,12 @@ export class SeyfertWebSocket {
 		const id = randomUUID();
 		if (this.__promises.has(id)) return this.#randomUUID();
 		return id;
+	}
+
+	#emitClose(close: { code: number; reason: string }) {
+		if (this.__closeEmitted) return;
+		this.__closeEmitted = true;
+		this.onclose(close);
 	}
 
 	get readyState() {
